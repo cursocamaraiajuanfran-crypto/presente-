@@ -1,0 +1,6 @@
+{
+  "name": "Presente",
+  "description": "Una app sencilla de control de asistencia con alertas, geolocalización y sincronización en tiempo real.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
