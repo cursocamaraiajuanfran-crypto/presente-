@@ -9,6 +9,9 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.media.RingtoneManager
+import android.media.Ringtone
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -96,6 +99,7 @@ data class ParticipantState(
 // Enables seamless cross-role testing on a single device/emulator
 object RoomSession {
     var roomCode by mutableStateOf("")
+    var roomName by mutableStateOf("")
     var centerLatitude by mutableDoubleStateOf(40.416775) // Default center (Madrid)
     var centerLongitude by mutableDoubleStateOf(-3.703790)
     var monitorName by mutableStateOf("Monitor")
@@ -107,6 +111,7 @@ object RoomSession {
 
     fun reset() {
         roomCode = ""
+        roomName = ""
         participants.clear()
         isCallActive = false
         callTimestamp = 0L
@@ -181,10 +186,21 @@ class MainActivity : ComponentActivity() {
                 ) { permissions ->
                     permissionGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
                             permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+                    
+                    val notificationsGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        permissions[Manifest.permission.POST_NOTIFICATIONS] == true
+                    } else {
+                        true
+                    }
+
                     if (permissionGranted) {
                         Toast.makeText(context, "Permisos GPS concedidos 📡", Toast.LENGTH_SHORT).show()
                     } else {
                         Toast.makeText(context, "GPS inactivo. Usando modo simulador de rango.", Toast.LENGTH_LONG).show()
+                    }
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationsGranted) {
+                        Toast.makeText(context, "Permiso de notificaciones denegado. No sonarán las alarmas correctamente.", Toast.LENGTH_LONG).show()
                     }
                 }
 
@@ -197,12 +213,19 @@ class MainActivity : ComponentActivity() {
                         currentLon = currentLongitude.doubleValue,
                         gpsActive = isGpsAvailable.value,
                         requestGpsPermission = {
-                            requestPermissionsLauncher.launch(
+                            val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                                    Manifest.permission.POST_NOTIFICATIONS
+                                )
+                            } else {
                                 arrayOf(
                                     Manifest.permission.ACCESS_FINE_LOCATION,
                                     Manifest.permission.ACCESS_COARSE_LOCATION
                                 )
-                            )
+                            }
+                            requestPermissionsLauncher.launch(permissionsToRequest)
                         }
                     )
                 }
@@ -233,6 +256,11 @@ fun RadarAppContent(
     var userRole by remember { mutableStateOf(Role.MONITOR) }
     var nicknameInput by remember { mutableStateOf("") }
     var roomCodeInput by remember { mutableStateOf("") }
+    var roomNameInput by remember { mutableStateOf("") }
+    var nicknameError by remember { mutableStateOf<String?>(null) }
+    var roomCodeError by remember { mutableStateOf<String?>(null) }
+    var roomNameError by remember { mutableStateOf<String?>(null) }
+    var isValidatingNickname by remember { mutableStateOf(false) }
 
     // Client-side simulated distance slider (for testing without walking around!)
     var simulatedDistance by remember { mutableFloatStateOf(6f) }
@@ -249,26 +277,56 @@ fun RadarAppContent(
             val isOutside = myDistance > 10f
 
             if (isParticipant && isOutside) {
-                // Play notification alert sound
-                try {
-                    val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-                    toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 350)
-                } catch (e: Exception) {
-                    // Fallback
-                }
-
-                // Vibrate the device
+                var ringtone: Ringtone? = null
                 val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-                vibrator?.let { v ->
-                    if (v.hasVibrator()) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            val pattern = longArrayOf(0, 300, 100, 300, 100, 300)
-                            v.vibrate(VibrationEffect.createWaveform(pattern, -1))
-                        } else {
-                            @Suppress("DEPRECATION")
-                            v.vibrate(500)
+
+                try {
+                    // Play notification/alarm alert sound
+                    try {
+                        val alertUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                        ringtone = RingtoneManager.getRingtone(context, alertUri)
+                        if (ringtone != null) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                ringtone.isLooping = true
+                            }
+                            ringtone.play()
+                        }
+                    } catch (e: Exception) {
+                        // Fallback using ToneGenerator if Ringtone fails
+                        try {
+                            val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+                            toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 4000)
+                        } catch (ex: Exception) {}
+                    }
+
+                    // Vibrate the device in a repeating pattern (vibrate 800ms, wait 400ms, repeat)
+                    vibrator?.let { v ->
+                        if (v.hasVibrator()) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                val pattern = longArrayOf(0, 800, 400, 800, 400)
+                                // 0 means repeat starting from index 0
+                                v.vibrate(VibrationEffect.createWaveform(pattern, 0))
+                            } else {
+                                @Suppress("DEPRECATION")
+                                val pattern = longArrayOf(0, 800, 400, 800, 400)
+                                @Suppress("DEPRECATION")
+                                v.vibrate(pattern, 0)
+                            }
                         }
                     }
+
+                    // Keep playing for a maximum of 30 seconds or until coroutine gets cancelled
+                    delay(30000)
+                } finally {
+                    // This block executes when LaunchedEffect finishes or is cancelled (when isCallActive is false)
+                    try {
+                        ringtone?.stop()
+                    } catch (e: Exception) {}
+                    try {
+                        vibrator?.cancel()
+                    } catch (e: Exception) {}
                 }
             }
         }
@@ -279,6 +337,11 @@ fun RadarAppContent(
         if (screenState == Screen.MENU) {
             nicknameInput = ""
             roomCodeInput = ""
+            roomNameInput = ""
+            nicknameError = null
+            roomCodeError = null
+            roomNameError = null
+            isValidatingNickname = false
         }
     }
 
@@ -385,13 +448,35 @@ fun RadarAppContent(
                 Screen.CREATE_ROOM -> {
                     CreateRoomScreen(
                         nicknameInput = nicknameInput,
-                        onNicknameChange = { nicknameInput = it },
-                        onCreateRoom = { nick ->
+                        onNicknameChange = { 
+                            nicknameInput = it
+                            nicknameError = null
+                        },
+                        roomNameInput = roomNameInput,
+                        onRoomNameChange = {
+                            roomNameInput = it
+                            roomNameError = null
+                        },
+                        onCreateRoom = { nick, rName ->
+                            val trimmedNick = nick.trim()
+                            val trimmedRoomName = rName.trim()
+                            if (trimmedNick.isEmpty()) {
+                                nicknameError = "El nickname no puede estar vacío"
+                                return@CreateRoomScreen
+                            }
+                            if (trimmedRoomName.isEmpty()) {
+                                roomNameError = "El nombre de la sala no puede estar vacío"
+                                return@CreateRoomScreen
+                            }
+                            nicknameError = null
+                            roomNameError = null
+                            
                             val generatedCode = (1000..9999).random().toString()
                             RoomSession.roomCode = generatedCode
+                            RoomSession.roomName = trimmedRoomName
                             RoomSession.centerLatitude = currentLat
                             RoomSession.centerLongitude = currentLon
-                            RoomSession.monitorName = nick.ifBlank { "Monitor" }
+                            RoomSession.monitorName = trimmedNick
                             
                             userRole = Role.MONITOR
                             screenState = Screen.ACTIVE_ROOM
@@ -401,6 +486,7 @@ fun RadarAppContent(
                                 FirestoreManager.createRoom(
                                     roomCode = generatedCode,
                                     monitorName = RoomSession.monitorName,
+                                    roomName = RoomSession.roomName,
                                     latitude = RoomSession.centerLatitude,
                                     longitude = RoomSession.centerLongitude,
                                     onSuccess = {
@@ -413,62 +499,95 @@ fun RadarAppContent(
                             } else {
                                 Toast.makeText(context, "Sala creada: $generatedCode 👑", Toast.LENGTH_SHORT).show()
                             }
-                        }
+                        },
+                        nicknameError = nicknameError,
+                        roomNameError = roomNameError
                     )
                 }
 
                 Screen.JOIN_ROOM -> {
                     JoinRoomScreen(
                         nicknameInput = nicknameInput,
-                        onNicknameChange = { nicknameInput = it },
+                        onNicknameChange = { 
+                            nicknameInput = it
+                            nicknameError = null
+                        },
                         roomCodeInput = roomCodeInput,
-                        onRoomCodeChange = { roomCodeInput = it },
+                        onRoomCodeChange = { 
+                            roomCodeInput = it
+                            roomCodeError = null
+                        },
                         onJoinRoom = { nick, code ->
-                            val isFirestoreRoom = FirestoreManager.isAvailable
+                            val trimmedNick = nick.trim()
+                            val trimmedCode = code.trim()
                             
-                            // Validate code matching local session if Firestore is unconfigured
-                            if (!isFirestoreRoom && RoomSession.roomCode.isNotEmpty() && code != RoomSession.roomCode) {
-                                Toast.makeText(context, "¡Código incorrecto o sala inactiva!", Toast.LENGTH_SHORT).show()
-                            } else {
-                                // Set up or join active session
-                                if (RoomSession.roomCode.isEmpty()) {
-                                    RoomSession.roomCode = code
-                                    RoomSession.centerLatitude = currentLat
-                                    RoomSession.centerLongitude = currentLon
-                                }
-                                val finalNick = nick.ifBlank { "Jugador_${(10..99).random()}" }
-                                nicknameInput = finalNick
-                                
-                                val distance = if (useSimulatedLocation) simulatedDistance else {
-                                    calculateDistance(currentLat, currentLon, RoomSession.centerLatitude, RoomSession.centerLongitude)
-                                }
-                                
-                                val newParticipant = ParticipantState(
-                                    nickname = finalNick,
-                                    distanceInMeters = distance,
-                                    isPresent = false,
-                                    isSimulated = useSimulatedLocation
-                                )
-                                RoomSession.participants[finalNick] = newParticipant
-                                userRole = Role.PARTICIPANT
-                                screenState = Screen.ACTIVE_ROOM
-                                
-                                // Push initial participant details to Firestore
-                                if (FirestoreManager.isAvailable) {
-                                    FirestoreManager.updateParticipantState(
-                                        roomCode = code,
-                                        nickname = finalNick,
-                                        distanceInMeters = distance,
-                                        isPresent = false,
-                                        isSimulated = useSimulatedLocation,
-                                        angle = newParticipant.angle
-                                    )
-                                    Toast.makeText(context, "Unido a la sala #$code (Sincronizado) 🌐", Toast.LENGTH_SHORT).show()
+                            if (trimmedNick.isEmpty()) {
+                                nicknameError = "El nickname no puede estar vacío"
+                                return@JoinRoomScreen
+                            }
+                            if (trimmedCode.isEmpty() || trimmedCode.length < 4) {
+                                roomCodeError = "Introduce un código de sala válido de 4 dígitos"
+                                return@JoinRoomScreen
+                            }
+                            
+                            isValidatingNickname = true
+                            FirestoreManager.checkNicknameAvailability(trimmedCode, trimmedNick) { isAvailable, errorMsg ->
+                                isValidatingNickname = false
+                                if (!isAvailable) {
+                                    nicknameError = errorMsg ?: "El nickname ya está en uso en esta sala."
                                 } else {
-                                    Toast.makeText(context, "Te has unido a la sala #$code (Local)", Toast.LENGTH_SHORT).show()
+                                    nicknameError = null
+                                    roomCodeError = null
+                                    
+                                    val isFirestoreRoom = FirestoreManager.isAvailable
+                                    
+                                    // Validate code matching local session if Firestore is unconfigured
+                                    if (!isFirestoreRoom && RoomSession.roomCode.isNotEmpty() && trimmedCode != RoomSession.roomCode) {
+                                        roomCodeError = "¡Código incorrecto o sala inactiva!"
+                                    } else {
+                                        // Set up or join active session
+                                        if (RoomSession.roomCode.isEmpty()) {
+                                            RoomSession.roomCode = trimmedCode
+                                            RoomSession.centerLatitude = currentLat
+                                            RoomSession.centerLongitude = currentLon
+                                        }
+                                        nicknameInput = trimmedNick
+                                        
+                                        val distance = if (useSimulatedLocation) simulatedDistance else {
+                                            calculateDistance(currentLat, currentLon, RoomSession.centerLatitude, RoomSession.centerLongitude)
+                                        }
+                                        
+                                        val newParticipant = ParticipantState(
+                                            nickname = trimmedNick,
+                                            distanceInMeters = distance,
+                                            isPresent = false,
+                                            isSimulated = useSimulatedLocation
+                                        )
+                                        RoomSession.participants[trimmedNick] = newParticipant
+                                        userRole = Role.PARTICIPANT
+                                        screenState = Screen.ACTIVE_ROOM
+                                        
+                                        // Push initial participant details to Firestore
+                                        if (FirestoreManager.isAvailable) {
+                                            FirestoreManager.updateParticipantState(
+                                                roomCode = trimmedCode,
+                                                nickname = trimmedNick,
+                                                distanceInMeters = distance,
+                                                isPresent = false,
+                                                isSimulated = useSimulatedLocation,
+                                                angle = newParticipant.angle
+                                            )
+                                            Toast.makeText(context, "Unido a la sala #$trimmedCode (Sincronizado) 🌐", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(context, "Te has unido a la sala #$trimmedCode (Local)", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
                                 }
                             }
-                        }
+                        },
+                        nicknameError = nicknameError,
+                        roomCodeError = roomCodeError,
+                        isValidating = isValidatingNickname
                     )
                 }
 
@@ -523,7 +642,7 @@ fun MenuScreen(
             ) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     Image(
-                        painter = painterResource(id = R.drawable.img_presente_banner),
+                        painter = painterResource(id = R.drawable.img_presente_banner_clear),
                         contentDescription = "Presente Header Banner",
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop
@@ -586,7 +705,7 @@ fun MenuScreen(
                 ) {
                     Text(
                         text = "PRESENTE",
-                        fontSize = 28.sp,
+                        fontSize = 38.sp,
                         fontWeight = FontWeight.ExtraBold,
                         color = Color.White,
                         letterSpacing = 4.sp,
@@ -597,8 +716,8 @@ fun MenuScreen(
                     
                     Text(
                         text = "Control de Asistencia Radar",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
                         color = NeonCyan,
                         letterSpacing = 1.sp,
                         textAlign = TextAlign.Center
@@ -607,10 +726,10 @@ fun MenuScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Text(
-                        text = "Administra o asiste de forma segura. La geolocalización de precisión sincroniza de manera automática tu estado de presencia a menos de 10 metros en tiempo real.",
-                        fontSize = 13.sp,
+                        text = "una aplicación para que tu grupo nunca se pierda",
+                        fontSize = 16.sp,
                         color = Color.LightGray,
-                        lineHeight = 18.sp,
+                        lineHeight = 22.sp,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -628,7 +747,7 @@ fun MenuScreen(
                     onClick = onCreateClick,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(58.dp),
+                        .height(64.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald),
                     shape = RoundedCornerShape(14.dp),
                     elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
@@ -637,13 +756,13 @@ fun MenuScreen(
                         imageVector = Icons.Default.AdminPanelSettings,
                         contentDescription = "Crear",
                         tint = RadarSlate900,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
                         text = "CREAR NUEVA SALA (MONITOR)",
                         fontWeight = FontWeight.ExtraBold,
-                        fontSize = 14.sp,
+                        fontSize = 17.sp,
                         color = RadarSlate900,
                         letterSpacing = 0.5.sp
                     )
@@ -654,7 +773,7 @@ fun MenuScreen(
                     onClick = onJoinClick,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(58.dp),
+                        .height(64.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = RadarSlate800),
                     shape = RoundedCornerShape(14.dp),
                     border = BorderStroke(1.5.dp, NeonCyan),
@@ -664,13 +783,13 @@ fun MenuScreen(
                         imageVector = Icons.Default.GroupAdd,
                         contentDescription = "Unirse",
                         tint = NeonCyan,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
                         text = "UNIRSE A SALA (PARTICIPANTE)",
                         fontWeight = FontWeight.ExtraBold,
-                        fontSize = 14.sp,
+                        fontSize = 17.sp,
                         color = NeonCyan,
                         letterSpacing = 0.5.sp
                     )
@@ -714,15 +833,15 @@ fun MenuScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = if (gpsActive) "GPS de alta precisión activo" else "GPS no autorizado o inactivo",
-                            fontSize = 13.sp,
+                            fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
                         )
                         Text(
                             text = if (gpsActive) "Coordenadas reales del satélite activadas." else "Se usará el simulador interactivo para pruebas.",
-                            fontSize = 11.sp,
+                            fontSize = 13.sp,
                             color = Color.Gray,
-                            lineHeight = 14.sp
+                            lineHeight = 16.sp
                         )
                     }
 
@@ -733,7 +852,7 @@ fun MenuScreen(
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                             shape = RoundedCornerShape(8.dp)
                         ) {
-                            Text("Activar", fontSize = 11.sp, color = Color.White)
+                            Text("Activar", fontSize = 13.sp, color = Color.White)
                         }
                     }
                 }
@@ -750,7 +869,11 @@ fun MenuScreen(
 fun CreateRoomScreen(
     nicknameInput: String,
     onNicknameChange: (String) -> Unit,
-    onCreateRoom: (String) -> Unit
+    roomNameInput: String,
+    onRoomNameChange: (String) -> Unit,
+    onCreateRoom: (String, String) -> Unit,
+    nicknameError: String? = null,
+    roomNameError: String? = null
 ) {
     Box(
         modifier = Modifier
@@ -794,7 +917,7 @@ fun CreateRoomScreen(
 
                 Text(
                     text = "ROL: MONITOR",
-                    fontSize = 11.sp,
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
                     color = NeonEmerald,
                     letterSpacing = 2.sp
@@ -804,7 +927,7 @@ fun CreateRoomScreen(
 
                 Text(
                     text = "Configurar Nueva Sala",
-                    fontSize = 22.sp,
+                    fontSize = 26.sp,
                     fontWeight = FontWeight.ExtraBold,
                     color = Color.White
                 )
@@ -812,33 +935,37 @@ fun CreateRoomScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "Escribe tu nickname de monitor. El sistema creará una sala segura con un código de radar único.",
-                    fontSize = 13.sp,
+                    text = "Escribe tu nickname y ponle nombre a tu sala (ej. Intercambio Letonia). El sistema creará un código de radar único.",
+                    fontSize = 15.sp,
                     color = Color.LightGray,
                     textAlign = TextAlign.Center,
-                    lineHeight = 18.sp,
+                    lineHeight = 20.sp,
                     modifier = Modifier.padding(horizontal = 8.dp)
                 )
 
-                Spacer(modifier = Modifier.height(28.dp))
+                Spacer(modifier = Modifier.height(24.dp))
 
                 // Monitor Nickname Input
                 OutlinedTextField(
                     value = nicknameInput,
                     onValueChange = onNicknameChange,
-                    label = { Text("Tu Identificador", color = Color.LightGray) },
+                    label = { Text("Tu Identificador", color = if (nicknameError != null) NeonCoral else Color.LightGray) },
                     placeholder = { Text("Ej. Supervisor Juan", color = Color.Gray) },
                     modifier = Modifier.fillMaxWidth(),
+                    isError = nicknameError != null,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = NeonEmerald,
-                        unfocusedBorderColor = RadarSlate700,
+                        unfocusedBorderColor = if (nicknameError != null) NeonCoral else RadarSlate700,
                         focusedLabelColor = NeonEmerald,
                         unfocusedLabelColor = Color.LightGray,
                         focusedTextColor = Color.White,
                         unfocusedTextColor = Color.White,
                         cursorColor = NeonEmerald,
                         focusedContainerColor = RadarSlate900.copy(alpha = 0.4f),
-                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f)
+                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f),
+                        errorBorderColor = NeonCoral,
+                        errorLabelColor = NeonCoral,
+                        errorCursorColor = NeonCoral
                     ),
                     shape = RoundedCornerShape(14.dp),
                     singleLine = true,
@@ -846,18 +973,79 @@ fun CreateRoomScreen(
                         Icon(
                             imageVector = Icons.Default.Badge,
                             contentDescription = "Nick",
-                            tint = NeonEmerald
+                            tint = if (nicknameError != null) NeonCoral else NeonEmerald
                         )
                     }
                 )
 
+                if (nicknameError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = nicknameError,
+                        color = NeonCoral,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .align(Alignment.Start)
+                            .padding(start = 4.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Room Name Input
+                OutlinedTextField(
+                    value = roomNameInput,
+                    onValueChange = onRoomNameChange,
+                    label = { Text("Nombre de la Sala", color = if (roomNameError != null) NeonCoral else Color.LightGray) },
+                    placeholder = { Text("Ej. Intercambio Letonia", color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    isError = roomNameError != null,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = NeonEmerald,
+                        unfocusedBorderColor = if (roomNameError != null) NeonCoral else RadarSlate700,
+                        focusedLabelColor = NeonEmerald,
+                        unfocusedLabelColor = Color.LightGray,
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        cursorColor = NeonEmerald,
+                        focusedContainerColor = RadarSlate900.copy(alpha = 0.4f),
+                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f),
+                        errorBorderColor = NeonCoral,
+                        errorLabelColor = NeonCoral,
+                        errorCursorColor = NeonCoral
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    singleLine = true,
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.Label,
+                            contentDescription = "Nombre de Sala",
+                            tint = if (roomNameError != null) NeonCoral else NeonEmerald
+                        )
+                    }
+                )
+
+                if (roomNameError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = roomNameError,
+                        color = NeonCoral,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .align(Alignment.Start)
+                            .padding(start = 4.dp)
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(28.dp))
 
                 Button(
-                    onClick = { onCreateRoom(nicknameInput) },
+                    onClick = { onCreateRoom(nicknameInput, roomNameInput) },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(54.dp),
+                        .height(58.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = NeonEmerald),
                     shape = RoundedCornerShape(14.dp),
                     elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
@@ -866,13 +1054,13 @@ fun CreateRoomScreen(
                         imageVector = Icons.Default.MeetingRoom,
                         contentDescription = "Iniciar",
                         tint = RadarSlate900,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         "INICIAR SALA DE CONTROL 👑",
                         fontWeight = FontWeight.ExtraBold,
-                        fontSize = 13.sp,
+                        fontSize = 16.sp,
                         color = RadarSlate900,
                         letterSpacing = 0.5.sp
                     )
@@ -888,7 +1076,10 @@ fun JoinRoomScreen(
     onNicknameChange: (String) -> Unit,
     roomCodeInput: String,
     onRoomCodeChange: (String) -> Unit,
-    onJoinRoom: (String, String) -> Unit
+    onJoinRoom: (String, String) -> Unit,
+    nicknameError: String? = null,
+    roomCodeError: String? = null,
+    isValidating: Boolean = false
 ) {
     Box(
         modifier = Modifier
@@ -932,7 +1123,7 @@ fun JoinRoomScreen(
 
                 Text(
                     text = "ROL: PARTICIPANTE",
-                    fontSize = 11.sp,
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
                     color = NeonCyan,
                     letterSpacing = 2.sp
@@ -942,7 +1133,7 @@ fun JoinRoomScreen(
 
                 Text(
                     text = "Unirse a una Sala",
-                    fontSize = 22.sp,
+                    fontSize = 26.sp,
                     fontWeight = FontWeight.ExtraBold,
                     color = Color.White
                 )
@@ -951,10 +1142,10 @@ fun JoinRoomScreen(
 
                 Text(
                     text = "Escribe tu nombre de participante y el código de 4 dígitos proporcionado por tu monitor.",
-                    fontSize = 13.sp,
+                    fontSize = 15.sp,
                     color = Color.LightGray,
                     textAlign = TextAlign.Center,
-                    lineHeight = 18.sp,
+                    lineHeight = 20.sp,
                     modifier = Modifier.padding(horizontal = 8.dp)
                 )
 
@@ -964,19 +1155,23 @@ fun JoinRoomScreen(
                 OutlinedTextField(
                     value = nicknameInput,
                     onValueChange = onNicknameChange,
-                    label = { Text("Tu Nombre Completo", color = Color.LightGray) },
+                    label = { Text("Tu Nombre Completo", color = if (nicknameError != null) NeonCoral else Color.LightGray) },
                     placeholder = { Text("Ej. Carlos Ramos", color = Color.Gray) },
                     modifier = Modifier.fillMaxWidth(),
+                    isError = nicknameError != null,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = NeonCyan,
-                        unfocusedBorderColor = RadarSlate700,
+                        unfocusedBorderColor = if (nicknameError != null) NeonCoral else RadarSlate700,
                         focusedLabelColor = NeonCyan,
                         unfocusedLabelColor = Color.LightGray,
                         focusedTextColor = Color.White,
                         unfocusedTextColor = Color.White,
                         cursorColor = NeonCyan,
                         focusedContainerColor = RadarSlate900.copy(alpha = 0.4f),
-                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f)
+                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f),
+                        errorBorderColor = NeonCoral,
+                        errorLabelColor = NeonCoral,
+                        errorCursorColor = NeonCoral
                     ),
                     shape = RoundedCornerShape(14.dp),
                     singleLine = true,
@@ -984,10 +1179,23 @@ fun JoinRoomScreen(
                         Icon(
                             imageVector = Icons.Default.PersonOutline,
                             contentDescription = "Nick Icon",
-                            tint = NeonCyan
+                            tint = if (nicknameError != null) NeonCoral else NeonCyan
                         )
                     }
                 )
+
+                if (nicknameError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = nicknameError,
+                        color = NeonCoral,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .align(Alignment.Start)
+                            .padding(start = 4.dp)
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -995,20 +1203,24 @@ fun JoinRoomScreen(
                 OutlinedTextField(
                     value = roomCodeInput,
                     onValueChange = onRoomCodeChange,
-                    label = { Text("Código de Sala (4 dígitos)", color = Color.LightGray) },
+                    label = { Text("Código de Sala (4 dígitos)", color = if (roomCodeError != null) NeonCoral else Color.LightGray) },
                     placeholder = { Text("Ej. 4279", color = Color.Gray) },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth(),
+                    isError = roomCodeError != null,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = NeonCyan,
-                        unfocusedBorderColor = RadarSlate700,
+                        unfocusedBorderColor = if (roomCodeError != null) NeonCoral else RadarSlate700,
                         focusedLabelColor = NeonCyan,
                         unfocusedLabelColor = Color.LightGray,
                         focusedTextColor = Color.White,
                         unfocusedTextColor = Color.White,
                         cursorColor = NeonCyan,
                         focusedContainerColor = RadarSlate900.copy(alpha = 0.4f),
-                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f)
+                        unfocusedContainerColor = RadarSlate900.copy(alpha = 0.2f),
+                        errorBorderColor = NeonCoral,
+                        errorLabelColor = NeonCoral,
+                        errorCursorColor = NeonCoral
                     ),
                     shape = RoundedCornerShape(14.dp),
                     singleLine = true,
@@ -1016,42 +1228,68 @@ fun JoinRoomScreen(
                         Icon(
                             imageVector = Icons.Default.Key,
                             contentDescription = "Code Icon",
-                            tint = NeonCyan
+                            tint = if (roomCodeError != null) NeonCoral else NeonCyan
                         )
                     }
                 )
+
+                if (roomCodeError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = roomCodeError,
+                        color = NeonCoral,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .align(Alignment.Start)
+                            .padding(start = 4.dp)
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(28.dp))
 
                 Button(
                     onClick = {
-                        if (roomCodeInput.isNotBlank()) {
-                            onJoinRoom(nicknameInput, roomCodeInput)
-                        } else {
-                            onJoinRoom(nicknameInput, "1234") // Fallback test room code
-                        }
+                        onJoinRoom(nicknameInput, roomCodeInput)
                     },
+                    enabled = !isValidating,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(54.dp),
+                        .height(58.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
                     shape = RoundedCornerShape(14.dp),
                     elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Map,
-                        contentDescription = "Ubicación",
-                        tint = RadarSlate900,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        "CONECTAR AL RADAR 🗺️",
-                        fontWeight = FontWeight.ExtraBold,
-                        fontSize = 13.sp,
-                        color = RadarSlate900,
-                        letterSpacing = 0.5.sp
-                    )
+                    if (isValidating) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = RadarSlate900,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            "VERIFICANDO...",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 16.sp,
+                            color = RadarSlate900,
+                            letterSpacing = 0.5.sp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Map,
+                            contentDescription = "Ubicación",
+                            tint = RadarSlate900,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            "CONECTAR AL RADAR 🗺️",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 16.sp,
+                            color = RadarSlate900,
+                            letterSpacing = 0.5.sp
+                        )
+                    }
                 }
             }
         }
@@ -1086,8 +1324,9 @@ fun ActiveRoomScreen(
         if (FirestoreManager.isAvailable && roomCode.isNotEmpty()) {
             FirestoreManager.startListeningToRoom(
                 roomCode = roomCode,
-                onRoomUpdate = { monitor, centerLat, centerLon, isCall, callTime ->
+                onRoomUpdate = { monitor, rName, centerLat, centerLon, isCall, callTime ->
                     RoomSession.monitorName = monitor
+                    RoomSession.roomName = rName
                     RoomSession.centerLatitude = centerLat
                     RoomSession.centerLongitude = centerLon
                     RoomSession.isCallActive = isCall
@@ -1203,7 +1442,7 @@ fun ActiveRoomScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
@@ -1212,15 +1451,20 @@ fun ActiveRoomScreen(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Sala #${roomCode.ifBlank { "1234" }}",
-                            fontSize = 16.sp,
+                            text = if (RoomSession.roomName.isNotBlank()) RoomSession.roomName else "Sala #${roomCode.ifBlank { "1234" }}",
+                            fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
                         )
                     }
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "Rol: ${if (role == Role.MONITOR) "Monitor (Creador)" else "Participante"}",
-                        fontSize = 12.sp,
+                        text = if (RoomSession.roomName.isNotBlank()) {
+                            "Código de Sala: #$roomCode • Rol: ${if (role == Role.MONITOR) "Monitor" else "Participante"}"
+                        } else {
+                            "Rol: ${if (role == Role.MONITOR) "Monitor (Creador)" else "Participante"}"
+                        },
+                        fontSize = 14.sp,
                         color = Color.LightGray
                     )
                 }
@@ -1234,7 +1478,7 @@ fun ActiveRoomScreen(
                     Text(
                         text = nickname,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        fontSize = 13.sp,
+                        fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
                         color = if (role == Role.MONITOR) NeonEmerald else NeonCyan
                     )
@@ -1270,15 +1514,15 @@ fun ActiveRoomScreen(
                 Column {
                     Text(
                         text = if (firestoreAvailable) "Sincronización en la Nube Activa (Firestore)" else "Modo de Sincronización Local (Offline)",
-                        fontSize = 11.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
                         color = if (firestoreAvailable) NeonEmerald else Color.LightGray
                     )
                     Text(
                         text = if (firestoreAvailable) "Las salas, coordenadas y asistencia se sincronizan en la nube en tiempo real." else "Sube tu google-services.json en AI Studio para conectar Firestore. El simulador funciona localmente.",
-                        fontSize = 9.sp,
+                        fontSize = 12.sp,
                         color = Color.Gray,
-                        lineHeight = 12.sp
+                        lineHeight = 15.sp
                     )
                 }
             }
@@ -1318,13 +1562,13 @@ fun ActiveRoomScreen(
                     Column(modifier = Modifier.padding(8.dp)) {
                         Text(
                             text = "Dentro: $insideCount / $totalParts",
-                            fontSize = 11.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
                             color = NeonEmerald
                         )
                         Text(
                             text = "Fuera: ${totalParts - insideCount}",
-                            fontSize = 11.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
                             color = NeonCoral
                         )
@@ -1360,13 +1604,13 @@ fun ActiveRoomScreen(
                     Column {
                         Text(
                             text = "¡ALERTA DE LLAMADA RECIBIDA!",
-                            fontSize = 14.sp,
+                            fontSize = 18.sp,
                             fontWeight = FontWeight.Bold,
                             color = RadarSlate900
                         )
                         Text(
                             text = "El monitor te llama. Estás fuera del rango de 10m.",
-                            fontSize = 12.sp,
+                            fontSize = 15.sp,
                             color = RadarSlate900
                         )
                     }
@@ -1459,7 +1703,7 @@ fun MonitorPanel(
         ) {
             Text(
                 text = "Participantes y Asistencia",
-                fontSize = 16.sp,
+                fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
@@ -1478,7 +1722,7 @@ fun MonitorPanel(
                     modifier = Modifier.size(16.dp)
                 )
                 Spacer(modifier = Modifier.width(4.dp))
-                Text("Añadir Prueba", fontSize = 12.sp, color = Color.White)
+                Text("Añadir Prueba", fontSize = 14.sp, color = Color.White)
             }
         }
 
@@ -1489,7 +1733,7 @@ fun MonitorPanel(
             onClick = onCallAction,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(50.dp),
+                .height(58.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (RoomSession.isCallActive) NeonCoral else NeonCoral.copy(alpha = 0.85f)
             ),
@@ -1504,7 +1748,7 @@ fun MonitorPanel(
             Text(
                 text = if (RoomSession.isCallActive) "¡ENVIANDO ALERTA SONORA! 🔊" else "Llamar a los de fuera 📢",
                 fontWeight = FontWeight.Bold,
-                fontSize = 15.sp,
+                fontSize = 18.sp,
                 color = Color.White
             )
         }
@@ -1539,8 +1783,8 @@ fun MonitorPanel(
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Todos", fontSize = 11.sp, color = Color.LightGray)
-                    Text("$totalCount", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "TODOS") NeonCyan else Color.White)
+                    Text("Todos", fontSize = 13.sp, color = Color.LightGray)
+                    Text("$totalCount", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "TODOS") NeonCyan else Color.White)
                 }
             }
 
@@ -1560,8 +1804,8 @@ fun MonitorPanel(
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Faltan por Llegar", fontSize = 11.sp, color = Color.LightGray)
-                    Text("$missingCount", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "FALTAN") NeonCoral else Color.White)
+                    Text("Faltan por Llegar", fontSize = 13.sp, color = Color.LightGray)
+                    Text("$missingCount", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "FALTAN") NeonCoral else Color.White)
                 }
             }
 
@@ -1581,8 +1825,8 @@ fun MonitorPanel(
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Presentes", fontSize = 11.sp, color = Color.LightGray)
-                    Text("$presentCount", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "PRESENTES") NeonEmerald else Color.White)
+                    Text("Presentes", fontSize = 13.sp, color = Color.LightGray)
+                    Text("$presentCount", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = if (selectedFilter == "PRESENTES") NeonEmerald else Color.White)
                 }
             }
         }
@@ -1678,11 +1922,11 @@ fun MonitorPanel(
                                         )
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Column(modifier = Modifier.weight(1f)) {
+                                 Column(modifier = Modifier.weight(1f)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Text(
                                             text = p.nickname,
-                                            fontSize = 14.sp,
+                                            fontSize = 17.sp,
                                             fontWeight = FontWeight.Bold,
                                             color = if (isOffline) Color.Gray else Color.White
                                         )
@@ -1690,7 +1934,7 @@ fun MonitorPanel(
                                             Spacer(modifier = Modifier.width(4.dp))
                                             Text(
                                                 text = "Desconectado",
-                                                fontSize = 9.sp,
+                                                fontSize = 11.sp,
                                                 color = Color.LightGray,
                                                 modifier = Modifier
                                                     .background(Color.Gray.copy(alpha = 0.25f), RoundedCornerShape(4.dp))
@@ -1700,7 +1944,7 @@ fun MonitorPanel(
                                             Spacer(modifier = Modifier.width(4.dp))
                                             Text(
                                                 text = "Sim",
-                                                fontSize = 9.sp,
+                                                fontSize = 11.sp,
                                                 color = NeonCyan,
                                                 modifier = Modifier
                                                     .background(NeonCyan.copy(alpha = 0.15f), RoundedCornerShape(4.dp))
@@ -1711,13 +1955,13 @@ fun MonitorPanel(
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Text(
                                             text = if (isOffline) "Desconectado" else if (isNear) "Dentro" else "Fuera",
-                                            fontSize = 11.sp,
+                                            fontSize = 14.sp,
                                             color = if (isOffline) Color.Gray else if (isNear) NeonEmerald else NeonCoral,
                                             fontWeight = FontWeight.SemiBold
                                         )
                                         Text(
                                             text = " • ${"%.1f".format(p.distanceInMeters)}m",
-                                            fontSize = 11.sp,
+                                            fontSize = 14.sp,
                                             color = Color.Gray
                                         )
                                     }
@@ -1769,7 +2013,7 @@ fun MonitorPanel(
                                         containerColor = if (isOffline) Color.Gray.copy(alpha = 0.1f) else if (p.isPresent) NeonEmerald.copy(alpha = 0.2f) else RadarSlate700
                                     ),
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                    modifier = Modifier.height(32.dp),
+                                    modifier = Modifier.height(36.dp),
                                     shape = RoundedCornerShape(8.dp)
                                 ) {
                                     Icon(
@@ -1781,7 +2025,7 @@ fun MonitorPanel(
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = if (isOffline) "DESCONECTADO" else if (p.isPresent) "PRESENTE" else "FALTA",
-                                        fontSize = 10.sp,
+                                        fontSize = 12.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = if (isOffline) Color.Gray else if (p.isPresent) NeonEmerald else NeonCoral
                                     )
@@ -1889,7 +2133,87 @@ fun ParticipantPanel(
     gpsActive: Boolean
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val isInside = distance <= 10f
+
+    // Location Verification state variables
+    var showVerificationDialog by remember { mutableStateOf(false) }
+    var verificationStep by remember { mutableStateOf("IDLE") } // IDLE, VERIFYING, SUCCESS, ERROR
+    var verificationMessage by remember { mutableStateOf("") }
+
+    if (showVerificationDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                if (verificationStep != "VERIFYING" && verificationStep != "SUCCESS") {
+                    showVerificationDialog = false
+                }
+            },
+            containerColor = RadarSlate800,
+            icon = {
+                Icon(
+                    imageVector = when (verificationStep) {
+                        "VERIFYING" -> Icons.Default.Radar
+                        "SUCCESS" -> Icons.Default.CheckCircle
+                        "ERROR" -> Icons.Default.Error
+                        else -> Icons.Default.LocationOn
+                    },
+                    contentDescription = null,
+                    tint = when (verificationStep) {
+                        "VERIFYING" -> NeonCyan
+                        "SUCCESS" -> NeonEmerald
+                        "ERROR" -> NeonCoral
+                        else -> Color.White
+                    },
+                    modifier = Modifier.size(36.dp)
+                )
+            },
+            title = {
+                Text(
+                    text = when (verificationStep) {
+                        "VERIFYING" -> "Verificando Ubicación..."
+                        "SUCCESS" -> "¡Asistencia Verificada!"
+                        "ERROR" -> "Error de Ubicación"
+                        else -> "Verificación de Asistencia"
+                    },
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    fontSize = 20.sp
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    if (verificationStep == "VERIFYING") {
+                        CircularProgressIndicator(
+                            color = NeonCyan,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .padding(bottom = 16.dp)
+                        )
+                    }
+                    Text(
+                        text = verificationMessage,
+                        color = Color.LightGray,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 18.sp
+                    )
+                }
+            },
+            confirmButton = {
+                if (verificationStep == "ERROR") {
+                    Button(
+                        onClick = { showVerificationDialog = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = NeonCoral)
+                    ) {
+                        Text("Entendido", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        )
+    }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         // --- Status Banner ---
@@ -1943,7 +2267,42 @@ fun ParticipantPanel(
 
         // --- Present Notification Button ---
         Button(
-            onClick = onPresentClick,
+            onClick = {
+                showVerificationDialog = true
+                verificationStep = "VERIFYING"
+                verificationMessage = "Solicitando satélites y verificando tu ubicación en el radar..."
+                scope.launch {
+                    delay(1500) // Simulates requesting location verification from system
+                    if (useSimulatedLocation) {
+                        if (distance <= 10f) {
+                            verificationStep = "SUCCESS"
+                            verificationMessage = "¡Ubicación simulada verificada correctamente dentro del rango de 10 metros!"
+                            delay(1200)
+                            onPresentClick()
+                            showVerificationDialog = false
+                        } else {
+                            verificationStep = "ERROR"
+                            verificationMessage = "Verificación fallida: Tu ubicación simulada (${"%.1f".format(distance)} metros) está fuera del límite de 10 metros. Por favor, acércate."
+                        }
+                    } else {
+                        if (!gpsActive) {
+                            verificationStep = "ERROR"
+                            verificationMessage = "Verificación fallida: El GPS está inactivo o sin permisos autorizados. Por favor, activa el GPS o usa el Simulador de Distancia para pruebas."
+                        } else {
+                            if (distance <= 10f) {
+                                verificationStep = "SUCCESS"
+                                verificationMessage = "¡Ubicación GPS real verificada correctamente dentro del rango!"
+                                delay(1200)
+                                onPresentClick()
+                                showVerificationDialog = false
+                            } else {
+                                verificationStep = "ERROR"
+                                verificationMessage = "Verificación fallida: No estás en el lugar correcto. Tu distancia real al monitor es de ${"%.1f".format(distance)} metros (Límite: 10 metros). Por favor, acércate físicamente."
+                            }
+                        }
+                    }
+                }
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .height(54.dp),

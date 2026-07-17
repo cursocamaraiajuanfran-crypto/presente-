@@ -32,6 +32,7 @@ object FirestoreManager {
     fun createRoom(
         roomCode: String,
         monitorName: String,
+        roomName: String,
         latitude: Double,
         longitude: Double,
         onSuccess: () -> Unit,
@@ -46,6 +47,7 @@ object FirestoreManager {
         val roomData = hashMapOf(
             "roomCode" to roomCode,
             "monitorName" to monitorName,
+            "roomName" to roomName,
             "centerLatitude" to latitude,
             "centerLongitude" to longitude,
             "isCallActive" to false,
@@ -140,7 +142,7 @@ object FirestoreManager {
      */
     fun startListeningToRoom(
         roomCode: String,
-        onRoomUpdate: (monitor: String, centerLat: Double, centerLon: Double, isCallActive: Boolean, callTime: Long) -> Unit,
+        onRoomUpdate: (monitor: String, roomName: String, centerLat: Double, centerLon: Double, isCallActive: Boolean, callTime: Long) -> Unit,
         onParticipantsUpdate: (List<ParticipantState>) -> Unit,
         onError: (Exception) -> Unit
     ) {
@@ -165,12 +167,13 @@ object FirestoreManager {
 
                 if (snapshot != null && snapshot.exists()) {
                     val monitor = snapshot.getString("monitorName") ?: "Monitor"
+                    val rName = snapshot.getString("roomName") ?: ""
                     val centerLat = snapshot.getDouble("centerLatitude") ?: 40.416775
                     val centerLon = snapshot.getDouble("centerLongitude") ?: -3.703790
                     val isCall = snapshot.getBoolean("isCallActive") ?: false
                     val callTime = snapshot.getLong("callTimestamp") ?: 0L
 
-                    onRoomUpdate(monitor, centerLat, centerLon, isCall, callTime)
+                    onRoomUpdate(monitor, rName, centerLat, centerLon, isCall, callTime)
                 }
             }
 
@@ -207,6 +210,67 @@ object FirestoreManager {
                     }
                     onParticipantsUpdate(participantList)
                 }
+            }
+    }
+
+    /**
+     * Checks if a nickname is unique/available in the given room (not used by monitor or other active participants).
+     */
+    fun checkNicknameAvailability(
+        roomCode: String,
+        nickname: String,
+        onResult: (isUnique: Boolean, error: String?) -> Unit
+    ) {
+        val firestore = db
+        if (firestore == null) {
+            // Local check if Firestore is unconfigured
+            val isMonitor = RoomSession.monitorName.equals(nickname, ignoreCase = true)
+            val isParticipant = RoomSession.participants.containsKey(nickname)
+            if (isMonitor || isParticipant) {
+                onResult(false, "El nickname ya está en uso en esta sala (Local).")
+            } else {
+                onResult(true, null)
+            }
+            return
+        }
+
+        // Fetch the room doc to check monitor name and existence
+        firestore.collection("rooms")
+            .document(roomCode)
+            .get()
+            .addOnSuccessListener { roomDoc ->
+                if (!roomDoc.exists()) {
+                    onResult(false, "La sala #$roomCode no existe.")
+                    return@addOnSuccessListener
+                }
+
+                val monitorName = roomDoc.getString("monitorName")
+                if (monitorName != null && monitorName.equals(nickname, ignoreCase = true)) {
+                    onResult(false, "El nickname coincide con el del Monitor.")
+                    return@addOnSuccessListener
+                }
+
+                // Check participants subcollection for duplicate nickname
+                firestore.collection("rooms")
+                    .document(roomCode)
+                    .collection("participants")
+                    .document(nickname)
+                    .get()
+                    .addOnSuccessListener { participantDoc ->
+                        if (participantDoc.exists()) {
+                            onResult(false, "El nickname ya está en uso en esta sala.")
+                        } else {
+                            onResult(true, null)
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e(TAG, "Error checking participant document existence", e)
+                        onResult(true, null)
+                    }
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Error checking room document existence", e)
+                onResult(true, null)
             }
     }
 
